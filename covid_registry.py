@@ -1,8 +1,11 @@
 import aiohttp
 import asyncio
+import time
+import pickle
 import pandas as pd
+import numpy as np
 from yarl import URL
-from datetime import date
+from datetime import date, timedelta
 
 class CovidRegistry:
     def __init__(self):
@@ -79,10 +82,13 @@ class CovidRegistry:
         )
 
 
-    async def dump(self, timerange, states=None, cities=None, places_of_death=None):
+    async def dump(self, timerange, states=None, cities=None, places_of_death=None, checkpoint_once_in=200, file='results.csv'):
+        epoch = time.time()
         df = pd.DataFrame(columns=self.columns)
+        create_file = True
 
         coroutines = []
+        failures = []
         for d in timerange.to_pydatetime():
             d = d.date()
             state_range = self.cities['uf'].unique() if states is None else states
@@ -102,13 +108,48 @@ class CovidRegistry:
                                 )
                             )
 
-        print(f'Number of coroutines: {len(coroutines)}')
-        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        while len(coroutines) > 0:
+            print(f'This operation will take {len(coroutines)} requests. Checkpoints will be created once every {checkpoint_once_in} requests.')
+            
+            for idx, co_chunk in enumerate(np.array_split(coroutines, np.ceil(len(coroutines)/checkpoint_once_in))):
+                results = await asyncio.gather(*co_chunk, return_exceptions=True)
 
-        failures = filter(lambda r: type(r) is RequestFailedError, results)
-        successes  = filter(lambda r: type(r) is not RequestFailedError, results)
+                failures.extend(
+                    [c for c, _ in filter(
+                        lambda t: type(t[1]) is RequestFailedError,
+                        zip(co_chunk, results)
+                    )]
+                )
+                successes  = filter(lambda r: type(r) is not RequestFailedError, results)
 
-        return df.append(list(successes), ignore_index=True), list(failures)
+                print(f'#{idx+1} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines)} requests -- {len(failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
+
+                point = df.append(list(successes), ignore_index=True)
+
+                # Saving current results
+                if create_file:
+                    point.to_csv(file)
+                    create_file = False
+                else:
+                    point.to_csv(file, mode='a', header=False)
+
+                # Saving remaining tasks
+                remaining_tasks = []
+                # Tasks that weren't reached yet
+                remaining_tasks.extend(coroutines[(idx*checkpoint_once_in + len(co_chunk)):])
+                # Tasks that failed
+                remaining_tasks.extend(failures)
+
+                if len(remaining_tasks) > 0:
+                    with open('remaining_tasks.pkl', 'wb') as o:
+                        pickle.dump(remaining_tasks, o)
+
+            coroutines = []
+            if len(failures) > 0:
+                print(f'{len(failures)} failures occured. Retrying...')
+                coroutines = failures
+                failures = []
+
         
     def _json_to_dataframe(self, json, d, state, city, gender, place_of_death):
         df = pd.DataFrame(columns=self.columns)
