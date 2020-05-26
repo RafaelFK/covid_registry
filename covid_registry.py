@@ -83,7 +83,7 @@ class CovidRegistry:
         )
 
     # TODO: Should write csv and pickle before first chunk. Otherwise, I wont be able to resume a dump that was canceled before that
-    async def dump(self, timerange, states=None, cities=None, places_of_death=None, checkpoint_once_in=200, file='results.csv'):
+    async def dump(self, timerange, states=None, cities=None, places_of_death=None, checkpoint_once_in=200, file='results.csv', pkl='remaining_tasks.pkl'):
         epoch = time.time()
         df = pd.DataFrame(columns=self.columns)
         create_file = True
@@ -99,15 +99,6 @@ class CovidRegistry:
                     for gender in self.genders:
                         places_range = self.places_of_death if places_of_death is None else places_of_death 
                         for place in places_range:
-                            # coroutines.append(
-                            #     self.query(
-                            #         date=d,
-                            #         state=state,
-                            #         city=city,
-                            #         gender=gender,
-                            #         place_of_death=place
-                            #     )
-                            # )
                             coroutines_args.append({
                                 'date': d,
                                 'state': state,
@@ -119,8 +110,7 @@ class CovidRegistry:
         while len(coroutines_args) > 0:
             print(f'This operation will take {len(coroutines_args)} requests. Checkpoints will be created once every {checkpoint_once_in} requests.')
             
-            for idx, co_chunk in enumerate(chunks(coroutines_args, of_size=checkpoint_once_in)):# enumerate(np.array_split(coroutines, np.ceil(len(coroutines)/checkpoint_once_in))):
-                # results = await asyncio.gather(*co_chunk, return_exceptions=True)
+            for idx, co_chunk in enumerate(chunks(coroutines_args, of_size=checkpoint_once_in)):
                 results = await asyncio.gather(
                     *map(lambda args: self.query(**args), coroutines_args),
                     return_exceptions=True
@@ -128,11 +118,11 @@ class CovidRegistry:
 
                 failures.extend(
                     [c for c, _ in filter(
-                        lambda t: type(t[1]) is RequestFailedError,
+                        lambda t: type(t[1]) is not pd.DataFrame,
                         zip(co_chunk, results)
                     )]
                 )
-                successes  = filter(lambda r: type(r) is not RequestFailedError, results)
+                successes  = filter(lambda r: type(r) is pd.DataFrame, results)
 
                 print(f'#{idx+1:04d} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines_args)} requests -- {len(failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
 
@@ -153,10 +143,10 @@ class CovidRegistry:
                 remaining_tasks.extend(failures)
 
                 if len(remaining_tasks) > 0:
-                    with open('remaining_tasks.pkl', 'wb') as o:
+                    with open(pkl, 'wb') as o:
                         pickle.dump(remaining_tasks, o)
                 else:
-                    f = Path('remaining_tasks.pkl')
+                    f = Path(pkl)
                     if f.is_file():
                         f.unlink()
 
@@ -188,18 +178,18 @@ class CovidRegistry:
 
                 failures.extend(
                     [c for c, _ in filter(
-                        lambda t: type(t[1]) is RequestFailedError,
+                        lambda t: type(t[1]) is not pd.DataFrame,
                         zip(co_chunk, results)
                     )]
                 )
-                successes  = filter(lambda r: type(r) is not RequestFailedError, results)
+                successes  = filter(lambda r: type(r) is pd.DataFrame, results)
 
                 print(f'#{idx+1:04d} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines_args)} requests -- {len(failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
 
                 point = df.append(list(successes), ignore_index=True)
 
                 # Saving current results
-                point.to_csv(file, mode='a', header=False)
+                point.to_csv(data_up_until_now, mode='a', header=False)
 
                 # Saving remaining tasks
                 remaining_tasks = []
@@ -209,10 +199,10 @@ class CovidRegistry:
                 remaining_tasks.extend(failures)
 
                 if len(remaining_tasks) > 0:
-                    with open('remaining_tasks.pkl', 'wb') as o:
+                    with open(remaining_tasks_pickle, 'wb') as o:
                         pickle.dump(remaining_tasks, o)
                 else:
-                    f = Path('remaining_tasks.pkl')
+                    f = Path(remaining_tasks_pickle)
                     if f.is_file():
                         f.unlink()
 
@@ -331,9 +321,12 @@ class RequestFailedError(Exception):
 
 
 def chunks(arr, of_size=1):
-    n = len(arr)//of_size
-    
-    for chunk in np.array_split(arr[:of_size*n], n):
-        yield chunk
+    if len(arr) <= of_size:
+        yield arr
+    else:
+        n = len(arr)//of_size
         
-    yield arr[of_size*n:]
+        for chunk in np.array_split(arr[:of_size*n], n):
+            yield chunk
+            
+        yield arr[of_size*n:]
