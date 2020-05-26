@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from yarl import URL
 from datetime import date, timedelta
+from pathlib import Path
 
 class CovidRegistry:
     def __init__(self):
@@ -81,13 +82,13 @@ class CovidRegistry:
             place_of_death=place_of_death
         )
 
-
+    # TODO: Should write csv and pickle before first chunk. Otherwise, I wont be able to resume a dump that was canceled before that
     async def dump(self, timerange, states=None, cities=None, places_of_death=None, checkpoint_once_in=200, file='results.csv'):
         epoch = time.time()
         df = pd.DataFrame(columns=self.columns)
         create_file = True
 
-        coroutines = []
+        coroutines_args = []
         failures = []
         for d in timerange.to_pydatetime():
             d = d.date()
@@ -98,21 +99,32 @@ class CovidRegistry:
                     for gender in self.genders:
                         places_range = self.places_of_death if places_of_death is None else places_of_death 
                         for place in places_range:
-                            coroutines.append(
-                                self.query(
-                                    date=d,
-                                    state=state,
-                                    city=city,
-                                    gender=gender,
-                                    place_of_death=place
-                                )
-                            )
+                            # coroutines.append(
+                            #     self.query(
+                            #         date=d,
+                            #         state=state,
+                            #         city=city,
+                            #         gender=gender,
+                            #         place_of_death=place
+                            #     )
+                            # )
+                            coroutines_args.append({
+                                'date': d,
+                                'state': state,
+                                'city': city,
+                                'gender': gender,
+                                'place_of_death': place
+                            })
 
-        while len(coroutines) > 0:
-            print(f'This operation will take {len(coroutines)} requests. Checkpoints will be created once every {checkpoint_once_in} requests.')
+        while len(coroutines_args) > 0:
+            print(f'This operation will take {len(coroutines_args)} requests. Checkpoints will be created once every {checkpoint_once_in} requests.')
             
-            for idx, co_chunk in enumerate(np.array_split(coroutines, np.ceil(len(coroutines)/checkpoint_once_in))):
-                results = await asyncio.gather(*co_chunk, return_exceptions=True)
+            for idx, co_chunk in enumerate(chunks(coroutines_args, of_size=checkpoint_once_in)):# enumerate(np.array_split(coroutines, np.ceil(len(coroutines)/checkpoint_once_in))):
+                # results = await asyncio.gather(*co_chunk, return_exceptions=True)
+                results = await asyncio.gather(
+                    *map(lambda args: self.query(**args), coroutines_args),
+                    return_exceptions=True
+                )
 
                 failures.extend(
                     [c for c, _ in filter(
@@ -122,7 +134,7 @@ class CovidRegistry:
                 )
                 successes  = filter(lambda r: type(r) is not RequestFailedError, results)
 
-                print(f'#{idx+1} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines)} requests -- {len(failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
+                print(f'#{idx+1:04d} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines_args)} requests -- {len(failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
 
                 point = df.append(list(successes), ignore_index=True)
 
@@ -136,21 +148,80 @@ class CovidRegistry:
                 # Saving remaining tasks
                 remaining_tasks = []
                 # Tasks that weren't reached yet
-                remaining_tasks.extend(coroutines[(idx*checkpoint_once_in + len(co_chunk)):])
+                remaining_tasks.extend(coroutines_args[(idx*checkpoint_once_in + len(co_chunk)):])
                 # Tasks that failed
                 remaining_tasks.extend(failures)
 
                 if len(remaining_tasks) > 0:
                     with open('remaining_tasks.pkl', 'wb') as o:
                         pickle.dump(remaining_tasks, o)
+                else:
+                    f = Path('remaining_tasks.pkl')
+                    if f.is_file():
+                        f.unlink()
 
-            coroutines = []
+            coroutines_args = []
             if len(failures) > 0:
                 print(f'{len(failures)} failures occured. Retrying...')
-                coroutines = failures
+                coroutines_args = failures
                 failures = []
 
-        
+
+    async def resume_dump(self, data_up_until_now, remaining_tasks_pickle, checkpoint_once_in=200):
+        epoch = time.time()
+        df = pd.DataFrame(columns=self.columns)
+        failures = []
+
+        # Deserialize pickle
+        with open(remaining_tasks_pickle, 'rb') as file:
+            coroutines_args = pickle.load(file)
+
+        while len(coroutines_args) > 0:
+            print(f'This operation will take {len(coroutines_args)} requests. Checkpoints will be created once every {checkpoint_once_in} requests.')
+            
+            for idx, co_chunk in enumerate(chunks(coroutines_args, of_size=checkpoint_once_in)):# enumerate(np.array_split(coroutines, np.ceil(len(coroutines)/checkpoint_once_in))):
+                # results = await asyncio.gather(*co_chunk, return_exceptions=True)
+                results = await asyncio.gather(
+                    *map(lambda args: self.query(**args), coroutines_args),
+                    return_exceptions=True
+                )
+
+                failures.extend(
+                    [c for c, _ in filter(
+                        lambda t: type(t[1]) is RequestFailedError,
+                        zip(co_chunk, results)
+                    )]
+                )
+                successes  = filter(lambda r: type(r) is not RequestFailedError, results)
+
+                print(f'#{idx+1:04d} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines_args)} requests -- {len(failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
+
+                point = df.append(list(successes), ignore_index=True)
+
+                # Saving current results
+                point.to_csv(file, mode='a', header=False)
+
+                # Saving remaining tasks
+                remaining_tasks = []
+                # Tasks that weren't reached yet
+                remaining_tasks.extend(coroutines_args[(idx*checkpoint_once_in + len(co_chunk)):])
+                # Tasks that failed
+                remaining_tasks.extend(failures)
+
+                if len(remaining_tasks) > 0:
+                    with open('remaining_tasks.pkl', 'wb') as o:
+                        pickle.dump(remaining_tasks, o)
+                else:
+                    f = Path('remaining_tasks.pkl')
+                    if f.is_file():
+                        f.unlink()
+
+            coroutines_args = []
+            if len(failures) > 0:
+                print(f'{len(failures)} failures occured. Retrying...')
+                coroutines_args = failures
+                failures = []
+
     def _json_to_dataframe(self, json, d, state, city, gender, place_of_death):
         df = pd.DataFrame(columns=self.columns)
 
@@ -180,11 +251,11 @@ class CovidRegistry:
 
 
     # Internal get. Appends XSRF token
-    async def _get(self, url, params=None, retry=5):
+    async def _get(self, url, params=None, retry=1):
         if self.session is None:
             raise Exception('A connection must be established first!')
 
-        for i in range(retry):
+        for _ in range(retry):
             req =  await self.session.get(
                 url,
                 params=params,
@@ -257,3 +328,12 @@ class RequestFailedError(Exception):
 
     def __str__(self):
         return f'{self.msg}'
+
+
+def chunks(arr, of_size=1):
+    n = len(arr)//of_size
+    
+    for chunk in np.array_split(arr[:of_size*n], n):
+        yield chunk
+        
+    yield arr[of_size*n:]
