@@ -16,6 +16,7 @@ class CovidRegistry:
         self.base_url = 'https://transparencia.registrocivil.org.br'
         self.landing_url = 'https://transparencia.registrocivil.org.br/especial-covid'
         self.api_url = 'https://transparencia.registrocivil.org.br/api/covid-covid-registral'
+        self.cardiac_url = 'https://transparencia.registrocivil.org.br/api/covid-cardiaco'
         self.base_headers = {
             'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:76.0) Gecko/20100101 Firefox/76.0'
         }
@@ -61,7 +62,7 @@ class CovidRegistry:
 
         return self.cities
 
-    async def query(self, date=date.today(), state='RJ', city='Rio de Janeiro', gender='M', place_of_death='HOSPITAL'):
+    async def query(self, date=date.today(), state='RJ', city='Rio de Janeiro', gender='M', place_of_death='HOSPITAL', include_cardiac=False):
         if self.session is None:
             raise Exception('A connection must be established first!')
 
@@ -71,7 +72,13 @@ class CovidRegistry:
         state, city, city_id = await self._state_and_city_keys(state, city)
 
         gender = self._gender_key(gender)
-        chart = 'chart2' if gender == 'M' else 'chart3'
+
+        if include_cardiac:
+            url = self.cardiac_url
+            chart = 'chartCardiac2' if gender == 'M' else 'chartCardiac3'
+        else:
+            url = self.api_url
+            chart = 'chart2' if gender == 'M' else 'chart3'
 
         place_of_death = self._place_of_death_key(place_of_death)
 
@@ -86,7 +93,7 @@ class CovidRegistry:
             'places[]': f'{place_of_death}'
         }
 
-        j = (await (await self._get(self.api_url, params)).json())['chart']
+        j = (await (await self._get(url, params)).json())['chart']
         return self._json_to_dataframe(
             json=j,
             d=date,
@@ -97,7 +104,7 @@ class CovidRegistry:
         )
 
     # TODO: Should write csv and pickle before first chunk. Otherwise, I wont be able to resume a dump that was canceled before that
-    async def dump(self, timerange, states=None, cities=None, places_of_death=None, checkpoint_once_in=200, file='results.csv', pkl='remaining_tasks.pkl', print_trace=False):
+    async def dump(self, timerange, states=None, cities=None, places_of_death=None, include_cardiac=False, checkpoint_once_in=200, file='results.csv', pkl='remaining_tasks.pkl', print_trace=False):
 
         # Create the list of tasks to be executed
         coroutines_args = []
@@ -117,7 +124,8 @@ class CovidRegistry:
                                 'state': state,
                                 'city': city,
                                 'gender': gender,
-                                'place_of_death': place
+                                'place_of_death': place,
+                                'include_cardiac': include_cardiac
                             })
 
         # Create initial table and remaining tasks pickle
