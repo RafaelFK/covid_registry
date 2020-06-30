@@ -7,6 +7,7 @@ import numpy as np
 from yarl import URL
 from datetime import date, timedelta
 from pathlib import Path
+from tqdm import tqdm
 import traceback
 
 
@@ -28,7 +29,7 @@ class CovidRegistry:
         self.columns = ['Date', 'State', 'City', 'Age',
                         'Gender', 'Place of Death', 'Cause', '#']
 
-    async def connect(self):
+    async def connect(self, attempts=5):
         if self.session is not None:
             await self.close()
 
@@ -36,10 +37,16 @@ class CovidRegistry:
 
         # Get session and XSRF token
         # TODO: check rensponse status
-        await self.session.get(self.landing_url)
-
-        if self.cities is None:
-            await self.get_cities()
+        try:
+            await self.session.get(self.landing_url)
+        except:
+            if attempts > 0:
+                await self.connect(attempts=attempts-1)
+            else:
+                raise
+        else:
+            if self.cities is None:
+                await self.get_cities()
 
     async def get_cities(self, force_update=True):
         if self.session is None:
@@ -132,73 +139,82 @@ class CovidRegistry:
         failures = []
         epoch = time.time()
         df = pd.DataFrame(columns=self.columns)
+        attempts = 0
 
         while len(coroutines_args) > 0:
-            print(
-                f'This operation will take {len(coroutines_args)} requests. Checkpoints will be created once every {checkpoint_once_in} requests.')
+            # print(f'This operation will take {len(coroutines_args)} requests. Checkpoints will be created once every {checkpoint_once_in} requests.')
+            description = "Progress" if attempts == 0 else "Retrying"
+            with tqdm(total=len(coroutines_args), unit='requests', desc=description) as pbar:
+                for idx, co_chunk in enumerate(chunks(coroutines_args, of_size=checkpoint_once_in)):
+                    # Open connection for chunk. This is an attempt to deal with 'server disconnected' issues
+                    await self.connect()
 
-            for idx, co_chunk in enumerate(chunks(coroutines_args, of_size=checkpoint_once_in)):
-                # Open connection for chunk. This is an attempt to deal with 'server disconnected' issues
-                await self.connect()
+                    results = await asyncio.gather(
+                        *map(lambda args: self.query(**args), co_chunk),
+                        return_exceptions=True
+                    )
 
-                results = await asyncio.gather(
-                    *map(lambda args: self.query(**args), co_chunk),
-                    return_exceptions=True
-                )
+                    new_failures = [t for t in filter(
+                        lambda t: type(t[1]) is not pd.DataFrame,
+                        zip(co_chunk, results)
+                    )]
 
-                new_failures = [t for t in filter(
-                    lambda t: type(t[1]) is not pd.DataFrame,
-                    zip(co_chunk, results)
-                )]
+                    failures.extend(new_failures)
 
-                failures.extend(new_failures)
+                    # Update progress bar
+                    pbar.set_postfix(failures=len(failures), refresh=False)
+                    pbar.update(len(co_chunk))
 
-                successes = filter(lambda r: type(r) is pd.DataFrame, results)
+                    successes = filter(lambda r: type(
+                        r) is pd.DataFrame, results)
 
-                print(f'#{idx+1:04d} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines_args)} requests -- {len(new_failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
+                    # print(f'#{idx+1:04d} -- {idx*checkpoint_once_in + len(co_chunk)}/{len(coroutines_args)} requests -- {len(new_failures)} failures -- Elapsed: {timedelta(seconds=time.time()-epoch)}')
 
-                if len(new_failures) > 0:
-                    unique_errors, indices = np.unique(
-                        list(map(lambda t: str(type(t[1])), new_failures)), return_index=True)
-                    print('Errors found in chunk:')
-                    print(
-                        f'{unique_errors}')
+                    # if len(new_failures) > 0:
+                    #     unique_errors, indices = np.unique(
+                    #         list(map(lambda t: str(type(t[1])), new_failures)), return_index=True)
+                    #     print('Errors found in chunk:')
+                    #     print(
+                    #         f'{unique_errors}')
 
-                    if print_trace:
-                        for idx in indices:
-                            exc = new_failures[idx][1]
-                            traceback.print_exception(
-                                type(exc), exc, exc.__traceback__)
+                    #     if print_trace:
+                    #         for idx in indices:
+                    #             exc = new_failures[idx][1]
+                    #             traceback.print_exception(
+                    #                 type(exc), exc, exc.__traceback__)
 
-                point = df.append(list(successes), ignore_index=True)
+                    point = df.append(list(successes), ignore_index=True)
 
-                # Saving current results
-                point.to_csv(datafile, mode='a', header=False, index=False)
+                    # Saving current results
+                    point.to_csv(datafile, mode='a', header=False, index=False)
 
-                # Saving remaining tasks
-                remaining_tasks = []
-                # Tasks that weren't reached yet
-                remaining_tasks.extend(
-                    coroutines_args[(idx*checkpoint_once_in + len(co_chunk)):])
-                # Tasks that failed
-                remaining_tasks.extend([c for c, _ in failures])
+                    # Saving remaining tasks
+                    remaining_tasks = []
+                    # Tasks that weren't reached yet
+                    remaining_tasks.extend(
+                        coroutines_args[(idx*checkpoint_once_in + len(co_chunk)):])
+                    # Tasks that failed
+                    remaining_tasks.extend([c for c, _ in failures])
 
-                if len(remaining_tasks) > 0:
-                    with open(pkl, 'wb') as o:
-                        pickle.dump(remaining_tasks, o)
-                else:
-                    f = Path(pkl)
-                    if f.is_file():
-                        f.unlink()
+                    if len(remaining_tasks) > 0:
+                        with open(pkl, 'wb') as o:
+                            pickle.dump(remaining_tasks, o)
+                    else:
+                        f = Path(pkl)
+                        if f.is_file():
+                            f.unlink()
 
-                # Close connection for chunk
-                await self.close()
+                    # Close connection for chunk
+                    await self.close()
 
-            coroutines_args = []
-            if len(failures) > 0:
-                print(f'{len(failures)} failures occured. Retrying...')
-                coroutines_args = [c for c, _ in failures]
-                failures = []
+                coroutines_args = []
+                if len(failures) > 0:
+                    # print(f'{len(failures)} failures occured. Retrying...')
+                    coroutines_args = [c for c, _ in failures]
+                    failures = []
+            attempts += 1
+
+        print(f'Total elapsed time: {timedelta(seconds=time.time()-epoch)}')
 
     def _json_to_dataframe(self, json, d, state, city, gender, place_of_death):
         df = pd.DataFrame(columns=self.columns)

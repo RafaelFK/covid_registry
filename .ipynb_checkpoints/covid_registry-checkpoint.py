@@ -7,6 +7,7 @@ import numpy as np
 from yarl import URL
 from datetime import date, timedelta
 from pathlib import Path
+from tqdm import tqdm
 import traceback
 
 
